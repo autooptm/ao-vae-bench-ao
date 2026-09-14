@@ -1,0 +1,6 @@
+torch
+numpy
+av
+huggingface_hub
+accelerate
+diffusers>=0.36
