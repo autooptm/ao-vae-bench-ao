@@ -1,0 +1,222 @@
+diff --git a/hunyuan_encode.py b/hunyuan_encode.py
+index f6d6e4f30bcedca01e9dbf1d654db014c0f1ea42..03c31ec6de4a1682112a35200bd0febe09fa90c9 100644
+--- a/hunyuan_encode.py
++++ b/hunyuan_encode.py
+@@ -17,6 +17,19 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
+ 
+ REPO = "hunyuanvideo-community/HunyuanVideo"
+ 
++AO_DEFAULT = "ao1,ao2,ao3"
++
++
++def _apply_opt(vae):
++    import torch._dynamo as _dynamo
++    _dynamo.config.automatic_dynamic_shapes = False
++    _dynamo.config.cache_size_limit = 128
++    _dynamo.config.accumulated_cache_size_limit = 1024
++
++    cls = type(vae.encoder)
++    cls.forward = torch.compile(cls.forward, dynamic=False)
++    return [cls.__name__]
++
+ 
+ def main():
+     ap = argparse.ArgumentParser()
+@@ -27,11 +40,18 @@ def main():
+     ap.add_argument("--width", type=int, default=832)
+     ap.add_argument("--stride", type=int, default=8)
+     ap.add_argument("--out", default=os.path.join(HERE, "out", "hunyuan_encode.json"))
++    ap.add_argument("--ao", default=os.environ.get("AO_OPT", AO_DEFAULT),
++                    help="comma-separated switches: ao1, ao2, ao3. "
++                         "Use 'none' for the original path.")
+     args = ap.parse_args()
++    ao = {s for s in args.ao.replace(" ", "").split(",") if s and s != "none"}
+ 
+     from diffusers import AutoencoderKLHunyuanVideo
+     dtype = torch.float16
+ 
++    if "ao3" in ao:
++        torch.backends.cudnn.benchmark = True
++
+     t0 = time.perf_counter()
+     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
+     clips = make_clips(frames, args.frames, args.height, args.width, args.clips, args.stride)
+@@ -43,6 +63,10 @@ def main():
+     vae.to("cuda").eval()
+     if True:
+         vae.enable_tiling()
++    if "ao1" in ao:
++        vae.tile_sample_min_num_frames = 1 << 14
++        vae.tile_sample_stride_num_frames = 1 << 14
++    opt_applied = _apply_opt(vae) if "ao2" in ao else []
+     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
+           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
+ 
+diff --git a/wan21_encode.py b/wan21_encode.py
+index 0b06c6763a439f14170e6f60cf8ac93742616ba4..ec2f07b2c54a0d24d43c73887215bc011492703b 100644
+--- a/wan21_encode.py
++++ b/wan21_encode.py
+@@ -18,6 +18,36 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
+ REPO = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+ 
+ 
++def _on(name, default="1"):
++    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
++
++
++def _apply_opt_5(vae, chunk):
++    def _encode(self, x):
++        _, _, num_frame, _, _ = x.shape
++        patch_size = getattr(self.config, "patch_size", None)
++        if patch_size is not None:
++            from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
++            x = patchify(x, patch_size=patch_size)
++        self.clear_cache()
++        self._enc_conv_idx = [0]
++        outs = [self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map,
++                             feat_idx=self._enc_conv_idx)]
++        i = 1
++        while i < num_frame:
++            j = min(i + chunk, num_frame)
++            self._enc_conv_idx = [0]
++            outs.append(self.encoder(x[:, :, i:j, :, :], feat_cache=self._enc_feat_map,
++                                     feat_idx=self._enc_conv_idx))
++            i = j
++        out = outs[0] if len(outs) == 1 else torch.cat(outs, 2)
++        enc = self.quant_conv(out)
++        self.clear_cache()
++        return enc
++
++    vae._encode = _encode.__get__(vae, type(vae))
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--video", default=VIDEO)
+@@ -30,7 +60,11 @@ def main():
+     args = ap.parse_args()
+ 
+     from diffusers import AutoencoderKLWan
+-    dtype = torch.float32
++    dtype = torch.float16 if os.environ.get("WAN21_OPT_1", "fp16").lower() == "fp16" \
++        else torch.float32
++
++    if _on("WAN21_OPT_2"):
++        torch.backends.cudnn.benchmark = True
+ 
+     t0 = time.perf_counter()
+     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
+@@ -43,6 +77,26 @@ def main():
+     vae.to("cuda").eval()
+     if False:
+         vae.enable_tiling()
++
++    if _on("WAN21_OPT_4") and _on("WAN21_OPT_3"):
++        with torch.no_grad():
++            for t in list(vae.parameters()) + list(vae.buffers()):
++                if t.dim() == 5:
++                    t.data = t.data.to(memory_format=torch.channels_last_3d)
++                elif t.dim() == 4:
++                    t.data = t.data.to(memory_format=torch.channels_last)
++
++    if _on("WAN21_OPT_3"):
++        for name in ("cache_size_limit", "recompile_limit",
++                     "accumulated_cache_size_limit", "accumulated_recompile_limit"):
++            if hasattr(torch._dynamo.config, name):
++                setattr(torch._dynamo.config, name, 256)
++        vae.encoder.forward = torch.compile(vae.encoder.forward, dynamic=False)
++
++    _chunk = int(os.environ.get("WAN21_OPT_5", "8"))
++    if _chunk > 4:
++        _apply_opt_5(vae, _chunk)
++
+     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
+           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
+ 
+diff --git a/wan22_encode.py b/wan22_encode.py
+index 6dad7ecbe5557097bea1aa2f3b70ee89da6a7015..f6d706eab1eeb4851550e9eeb259e50ad2fb5869 100644
+--- a/wan22_encode.py
++++ b/wan22_encode.py
+@@ -17,6 +17,52 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
+ 
+ REPO = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+ 
++_AO_OPT_1 = os.environ.get("WAN22_OPT_1", "fp16").lower()
++_AO_OPT_2 = os.environ.get("WAN22_OPT_2", "on").lower()
++_AO_OPT_3 = os.environ.get("WAN22_OPT_3", "1") == "1"
++_AO_OPT_4 = os.environ.get("WAN22_OPT_4", "0") == "1"
++_AO_OPT_5 = os.environ.get("WAN22_OPT_5", "0") == "1"
++
++
++def _ao_opt_norm():
++    from diffusers.models.autoencoders import autoencoder_kl_wan as _m
++    rms, orig = _m.WanRMS_norm, _m.WanRMS_norm.forward
++
++    def forward(self, x):
++        if not self.channel_first:
++            return orig(self, x)
++        g = self.gamma.reshape(-1)
++        perm = (0, 2, 3, 4, 1) if x.dim() == 5 else (0, 2, 3, 1)
++        back = (0, 4, 1, 2, 3) if x.dim() == 5 else (0, 3, 1, 2)
++        y = torch.nn.functional.rms_norm(x.permute(*perm), (g.numel(),), g, eps=1e-12)
++        y = y.permute(*back)
++        return y + self.bias if isinstance(self.bias, torch.Tensor) else y
++
++    rms.forward = forward
++
++
++def _ao_accelerate(vae):
++    opt_mode = torch.channels_last_3d if _AO_OPT_2 == "on" else None
++    if opt_mode is not None:
++        for m in vae.encoder.modules():
++            w = getattr(m, "weight", None)
++            if isinstance(m, torch.nn.Conv3d) and w is not None and w.dim() == 5:
++                m.weight.data = w.data.contiguous(memory_format=opt_mode)
++        if getattr(vae, "quant_conv", None) is not None and vae.quant_conv.weight.dim() == 5:
++            vae.quant_conv.weight.data = vae.quant_conv.weight.data.contiguous(
++                memory_format=opt_mode)
++
++    opt_dt = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_AO_OPT_1)
++    if opt_dt is not None:
++        vae.encoder.to(opt_dt)
++        if getattr(vae, "quant_conv", None) is not None:
++            vae.quant_conv.to(opt_dt)
++    if _AO_OPT_4:
++        _ao_opt_norm()
++    if _AO_OPT_5 and getattr(vae, "decoder", None) is not None:
++        vae.decoder = None
++    return opt_dt, opt_mode
++
+ 
+ def main():
+     ap = argparse.ArgumentParser()
+@@ -32,6 +78,9 @@ def main():
+     from diffusers import AutoencoderKLWan
+     dtype = torch.float32
+ 
++    if _AO_OPT_3:
++        torch.backends.cudnn.benchmark = True
++
+     t0 = time.perf_counter()
+     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
+     clips = make_clips(frames, args.frames, args.height, args.width, args.clips, args.stride)
+@@ -43,6 +92,7 @@ def main():
+     vae.to("cuda").eval()
+     if False:
+         vae.enable_tiling()
++    opt_dt, opt_mode = _ao_accelerate(vae)
+     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
+           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
+ 
+@@ -52,7 +102,10 @@ def main():
+             torch.cuda.synchronize()
+             t0 = time.perf_counter()
+             x = clip.to("cuda", dtype)
+-            z = vae.encode(x).latent_dist.mode()
++            if opt_mode is not None:
++                x = x.contiguous(memory_format=opt_mode)
++            with torch.autocast("cuda", dtype=opt_dt or torch.float16, enabled=opt_dt is not None):
++                z = vae.encode(x).latent_dist.mode()
+             torch.cuda.synchronize()
+             dt = time.perf_counter() - t0
+             walls.append(dt)

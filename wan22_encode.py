@@ -17,6 +17,52 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
 
 REPO = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 
+_AO_OPT_1 = os.environ.get("WAN22_OPT_1", "fp16").lower()
+_AO_OPT_2 = os.environ.get("WAN22_OPT_2", "on").lower()
+_AO_OPT_3 = os.environ.get("WAN22_OPT_3", "1") == "1"
+_AO_OPT_4 = os.environ.get("WAN22_OPT_4", "0") == "1"
+_AO_OPT_5 = os.environ.get("WAN22_OPT_5", "0") == "1"
+
+
+def _ao_opt_norm():
+    from diffusers.models.autoencoders import autoencoder_kl_wan as _m
+    rms, orig = _m.WanRMS_norm, _m.WanRMS_norm.forward
+
+    def forward(self, x):
+        if not self.channel_first:
+            return orig(self, x)
+        g = self.gamma.reshape(-1)
+        perm = (0, 2, 3, 4, 1) if x.dim() == 5 else (0, 2, 3, 1)
+        back = (0, 4, 1, 2, 3) if x.dim() == 5 else (0, 3, 1, 2)
+        y = torch.nn.functional.rms_norm(x.permute(*perm), (g.numel(),), g, eps=1e-12)
+        y = y.permute(*back)
+        return y + self.bias if isinstance(self.bias, torch.Tensor) else y
+
+    rms.forward = forward
+
+
+def _ao_accelerate(vae):
+    opt_mode = torch.channels_last_3d if _AO_OPT_2 == "on" else None
+    if opt_mode is not None:
+        for m in vae.encoder.modules():
+            w = getattr(m, "weight", None)
+            if isinstance(m, torch.nn.Conv3d) and w is not None and w.dim() == 5:
+                m.weight.data = w.data.contiguous(memory_format=opt_mode)
+        if getattr(vae, "quant_conv", None) is not None and vae.quant_conv.weight.dim() == 5:
+            vae.quant_conv.weight.data = vae.quant_conv.weight.data.contiguous(
+                memory_format=opt_mode)
+
+    opt_dt = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(_AO_OPT_1)
+    if opt_dt is not None:
+        vae.encoder.to(opt_dt)
+        if getattr(vae, "quant_conv", None) is not None:
+            vae.quant_conv.to(opt_dt)
+    if _AO_OPT_4:
+        _ao_opt_norm()
+    if _AO_OPT_5 and getattr(vae, "decoder", None) is not None:
+        vae.decoder = None
+    return opt_dt, opt_mode
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -32,6 +78,9 @@ def main():
     from diffusers import AutoencoderKLWan
     dtype = torch.float32
 
+    if _AO_OPT_3:
+        torch.backends.cudnn.benchmark = True
+
     t0 = time.perf_counter()
     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
     clips = make_clips(frames, args.frames, args.height, args.width, args.clips, args.stride)
@@ -43,6 +92,7 @@ def main():
     vae.to("cuda").eval()
     if False:
         vae.enable_tiling()
+    opt_dt, opt_mode = _ao_accelerate(vae)
     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
 
@@ -52,7 +102,10 @@ def main():
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             x = clip.to("cuda", dtype)
-            z = vae.encode(x).latent_dist.mode()
+            if opt_mode is not None:
+                x = x.contiguous(memory_format=opt_mode)
+            with torch.autocast("cuda", dtype=opt_dt or torch.float16, enabled=opt_dt is not None):
+                z = vae.encode(x).latent_dist.mode()
             torch.cuda.synchronize()
             dt = time.perf_counter() - t0
             walls.append(dt)

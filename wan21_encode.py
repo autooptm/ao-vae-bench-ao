@@ -18,6 +18,36 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
 REPO = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
 
 
+def _on(name, default="1"):
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _apply_opt_5(vae, chunk):
+    def _encode(self, x):
+        _, _, num_frame, _, _ = x.shape
+        patch_size = getattr(self.config, "patch_size", None)
+        if patch_size is not None:
+            from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
+            x = patchify(x, patch_size=patch_size)
+        self.clear_cache()
+        self._enc_conv_idx = [0]
+        outs = [self.encoder(x[:, :, :1, :, :], feat_cache=self._enc_feat_map,
+                             feat_idx=self._enc_conv_idx)]
+        i = 1
+        while i < num_frame:
+            j = min(i + chunk, num_frame)
+            self._enc_conv_idx = [0]
+            outs.append(self.encoder(x[:, :, i:j, :, :], feat_cache=self._enc_feat_map,
+                                     feat_idx=self._enc_conv_idx))
+            i = j
+        out = outs[0] if len(outs) == 1 else torch.cat(outs, 2)
+        enc = self.quant_conv(out)
+        self.clear_cache()
+        return enc
+
+    vae._encode = _encode.__get__(vae, type(vae))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", default=VIDEO)
@@ -30,7 +60,11 @@ def main():
     args = ap.parse_args()
 
     from diffusers import AutoencoderKLWan
-    dtype = torch.float32
+    dtype = torch.float16 if os.environ.get("WAN21_OPT_1", "fp16").lower() == "fp16" \
+        else torch.float32
+
+    if _on("WAN21_OPT_2"):
+        torch.backends.cudnn.benchmark = True
 
     t0 = time.perf_counter()
     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
@@ -43,6 +77,26 @@ def main():
     vae.to("cuda").eval()
     if False:
         vae.enable_tiling()
+
+    if _on("WAN21_OPT_4") and _on("WAN21_OPT_3"):
+        with torch.no_grad():
+            for t in list(vae.parameters()) + list(vae.buffers()):
+                if t.dim() == 5:
+                    t.data = t.data.to(memory_format=torch.channels_last_3d)
+                elif t.dim() == 4:
+                    t.data = t.data.to(memory_format=torch.channels_last)
+
+    if _on("WAN21_OPT_3"):
+        for name in ("cache_size_limit", "recompile_limit",
+                     "accumulated_cache_size_limit", "accumulated_recompile_limit"):
+            if hasattr(torch._dynamo.config, name):
+                setattr(torch._dynamo.config, name, 256)
+        vae.encoder.forward = torch.compile(vae.encoder.forward, dynamic=False)
+
+    _chunk = int(os.environ.get("WAN21_OPT_5", "8"))
+    if _chunk > 4:
+        _apply_opt_5(vae, _chunk)
+
     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
 

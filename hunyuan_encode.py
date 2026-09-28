@@ -17,6 +17,19 @@ from vae_common import HERE, VIDEO, load_frames, make_clips, write_summary
 
 REPO = "hunyuanvideo-community/HunyuanVideo"
 
+AO_DEFAULT = "ao1,ao2,ao3"
+
+
+def _apply_opt(vae):
+    import torch._dynamo as _dynamo
+    _dynamo.config.automatic_dynamic_shapes = False
+    _dynamo.config.cache_size_limit = 128
+    _dynamo.config.accumulated_cache_size_limit = 1024
+
+    cls = type(vae.encoder)
+    cls.forward = torch.compile(cls.forward, dynamic=False)
+    return [cls.__name__]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -27,10 +40,17 @@ def main():
     ap.add_argument("--width", type=int, default=832)
     ap.add_argument("--stride", type=int, default=8)
     ap.add_argument("--out", default=os.path.join(HERE, "out", "hunyuan_encode.json"))
+    ap.add_argument("--ao", default=os.environ.get("AO_OPT", AO_DEFAULT),
+                    help="comma-separated switches: ao1, ao2, ao3. "
+                         "Use 'none' for the original path.")
     args = ap.parse_args()
+    ao = {s for s in args.ao.replace(" ", "").split(",") if s and s != "none"}
 
     from diffusers import AutoencoderKLHunyuanVideo
     dtype = torch.float16
+
+    if "ao3" in ao:
+        torch.backends.cudnn.benchmark = True
 
     t0 = time.perf_counter()
     frames = load_frames(args.video, args.frames + args.stride * (args.clips - 1))
@@ -43,6 +63,10 @@ def main():
     vae.to("cuda").eval()
     if True:
         vae.enable_tiling()
+    if "ao1" in ao:
+        vae.tile_sample_min_num_frames = 1 << 14
+        vae.tile_sample_stride_num_frames = 1 << 14
+    opt_applied = _apply_opt(vae) if "ao2" in ao else []
     print(f"model: {REPO} vae loaded in {time.perf_counter() - t0:.1f}s "
           f"({sum(p.numel() for p in vae.parameters()) / 1e6:.0f}M params, {dtype})", flush=True)
 
